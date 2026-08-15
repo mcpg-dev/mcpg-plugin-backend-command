@@ -1,0 +1,42 @@
+[package]
+name = "mcpg-plugin-backend-command"
+version = "0.1.0-alpha.15"
+license = "Apache-2.0"
+edition = "2024"
+description = """
+Command (subprocess) backend binding plugin for mcpg. Dispatches tool
+calls by spawning a local process, writing the call arguments as a JSON
+document on stdin, and capturing stdout/stderr under byte + wall-clock
+limits. Args support CEL templating against $arguments / $context; the
+command itself is never templated (security). Unlike the network
+backends it pulls no HTTP/reqwest machinery. Mirrors the http/grpc/
+graphql first-party plugin shape; the main mcpg binary loads this crate
+at runtime via the plugin registry and carries no inline command code.
+"""
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+cdylib-export = []
+# Declared empty so the SDK macro's `register_static` accessor does not
+# trip `unexpected_cfgs`. command is consumed as a cdylib.
+static-firstparty = []
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# CEL template compilation/evaluation for per-call arg resolution
+# (DynamicValue / ExprContext). NO net-core: command is local-process,
+# no HTTP/SSRF/cred:// machinery.
+mcpg-expr            = { git = "https://github.com/mcpg-dev/mcpg-expr", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-sdk      = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", features = ["static-firstparty"] }
+mcpg-plugin-host     = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+async-trait    = "0.1"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+tokio          = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros"] }
+tracing        = "0.1"
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

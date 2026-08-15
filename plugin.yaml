@@ -1,0 +1,17 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.backend.command
+name: Command Binding
+license: Apache-2.0
+description: |
+  Dispatches tool calls by spawning an operator-configured local
+  process: the call arguments are written as a JSON document on the
+  child's stdin, and stdout/stderr are captured under byte + wall-clock
+  limits. The configured args support CEL templating against
+  $arguments / $context; the command path itself is never templated.
+  A non-zero exit, timeout, output-capture failure, or (when
+  require_json_stdout is set) non-JSON stdout is surfaced as a
+  tool-level error.
+class: backend
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities: []
