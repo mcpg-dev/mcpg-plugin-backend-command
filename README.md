@@ -65,6 +65,7 @@ mcp:
 | `timeout_ms` | u64 | `5000` | Wall-clock budget; the child is killed on expiry. Must be greater than 0. |
 | `max_output_bytes` | usize | `65536` | Per-stream capture cap for stdout and stderr. Must be greater than 0. |
 | `require_json_stdout` | bool | `false` | When true, stdout that is empty or not JSON-parseable becomes a downstream error. |
+| `result` | `envelope` \| `tool_result` | `envelope` | `envelope` returns the process envelope below. `tool_result` returns stdout as the MCP tool result itself; see [Tool results from stdout](#tool-results-from-stdout). |
 
 Arg templates are compiled at registration time, so a malformed CEL
 expression fails the binding at boot rather than on the first call. A
@@ -93,6 +94,35 @@ reaches the child as a verbatim literal, never as a resolved secret.
 `execution_error`), with the full list under `downstreamErrors`. Each
 error carries a stable `code`, a `retryable` flag, and a
 `suggestedAction` string.
+
+## Tool results from stdout
+With `result: tool_result` the process prints the MCP `CallToolResult` as
+JSON on stdout, and the client receives it as it is: text, image, audio and
+resource blocks, `structuredContent`, and the script's own `isError`. Use it
+when a tool returns an image (a screenshot, a chart) or when the script
+already knows the exact answer to give.
+
+```yaml
+backend:
+  kind: command
+  command: /usr/local/bin/snapshot
+  result: tool_result
+  max_output_bytes: 16777216
+```
+
+```json
+{"content":[{"type":"image","data":"iVBORw0…","mimeType":"image/png"},
+            {"type":"text","text":"1512x982 px"}]}
+```
+
+Stdout must be one JSON object with a `content` array whose blocks each have
+a string `type`, and an optional boolean `isError`. Every other outcome is an
+error result with one line of text and no process envelope: a timeout, a
+non-zero exit (with the last 2000 characters of stderr), stdout larger than
+`max_output_bytes`, or stdout that is not a tool result.
+
+The result crosses the plugin boundary as one payload, so a large image needs
+`plugins[].ffi_limits.max_payload_bytes` above the 256 KiB default.
 
 ## MCP surfaces & composition
 The binding is declared per capability under `mcp.capabilities.*`; the

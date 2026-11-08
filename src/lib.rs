@@ -59,7 +59,24 @@ struct CommandBackendSpec {
     max_output_bytes: usize,
     #[serde(default)]
     require_json_stdout: bool,
+    #[serde(default)]
+    result: ResultFormat,
 }
+
+/// What a call returns to the MCP client.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResultFormat {
+    /// The structured process envelope (exit code, stdout, stderr, …).
+    #[default]
+    Envelope,
+    /// Stdout is the MCP `CallToolResult` itself (text, image, audio,
+    /// resource blocks). A failed run is an error result with a short reason.
+    ToolResult,
+}
+
+/// Longest stderr tail an error result quotes in `result: tool_result`.
+const TOOL_RESULT_STDERR_TAIL: usize = 2_000;
 
 /// Per-binding runtime state. `command` is structural (never templated);
 /// each arg is a compiled CEL template resolved per call against the
@@ -71,6 +88,7 @@ struct CommandProfile {
     timeout_ms: u64,
     max_output_bytes: usize,
     require_json_stdout: bool,
+    result: ResultFormat,
 }
 
 /// `BackendPlugin` implementation for `kind: "command"`.
@@ -163,6 +181,7 @@ impl BackendPlugin for CommandBackendPlugin {
                 timeout_ms: parsed.timeout_ms,
                 max_output_bytes: parsed.max_output_bytes,
                 require_json_stdout: parsed.require_json_stdout,
+                result: parsed.result,
             },
         );
         Ok(())
@@ -205,6 +224,11 @@ impl BackendPlugin for CommandBackendPlugin {
         for (i, tmpl) in profile.arg_templates.iter().enumerate() {
             match tmpl.resolve(&expr_ctx) {
                 Ok(v) => resolved_args.push(v),
+                Err(e) if profile.result == ResultFormat::ToolResult => {
+                    return Ok(tool_error_response(format!(
+                        "command arg[{i}] expression failed: {e}"
+                    )));
+                }
                 Err(e) => {
                     let envelope = build_command_envelope(
                         &tool_name,
@@ -254,6 +278,13 @@ impl BackendPlugin for CommandBackendPlugin {
                 message: format!("command exec task join failed: {e}"),
             })?;
 
+        if profile.result == ResultFormat::ToolResult {
+            return Ok(match exec_result {
+                Ok(result) => tool_result_response(&result, &profile),
+                Err(error) => tool_error_response(format!("command could not run: {error}")),
+            });
+        }
+
         let envelope = match exec_result {
             Ok(result) => {
                 let (stdout_json, stdout_json_parse_error, stdout_json_validation_error) =
@@ -296,6 +327,87 @@ impl BackendPlugin for CommandBackendPlugin {
         map.insert("command.transport".to_owned(), serde_json::json!("plugin"));
         map
     }
+}
+
+/// The key the gateway reads as a complete `CallToolResult`.
+const VERBATIM_RESULT_KEY: &str = "__mcpg_verbatim_result";
+
+/// `result: tool_result` — a clean run's stdout is the `CallToolResult`;
+/// anything else is an error result that says why.
+fn tool_result_response(
+    result: &CommandExecutionResult,
+    profile: &CommandProfile,
+) -> BackendResponse {
+    if result.timed_out {
+        return tool_error_response(format!("command timed out after {} ms", profile.timeout_ms));
+    }
+    if let Some(error) = &result.read_error {
+        return tool_error_response(format!("reading the command output failed: {error}"));
+    }
+    if !result.success {
+        let status = result
+            .exit_code
+            .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}"));
+        let stderr = stderr_tail(&result.stderr);
+        return tool_error_response(if stderr.is_empty() {
+            format!("command exited with {status}")
+        } else {
+            format!("command exited with {status}: {stderr}")
+        });
+    }
+    if result.stdout_truncated {
+        return tool_error_response(format!(
+            "command stdout is larger than max_output_bytes ({})",
+            profile.max_output_bytes
+        ));
+    }
+    match parse_tool_result(&result.stdout) {
+        Ok(tool_result) => {
+            envelope_response(serde_json::json!({ VERBATIM_RESULT_KEY: tool_result }))
+        }
+        Err(reason) => {
+            tool_error_response(format!("command stdout is not a tool result: {reason}"))
+        }
+    }
+}
+
+/// Check the shape the gateway needs: an object with a `content` array of
+/// typed blocks and, when present, a boolean `isError`.
+fn parse_tool_result(stdout: &str) -> Result<Value, String> {
+    let value: Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("not JSON ({e})"))?;
+    let content = value
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "no `content` array".to_owned())?;
+    for (i, block) in content.iter().enumerate() {
+        if block.get("type").and_then(Value::as_str).is_none() {
+            return Err(format!("content[{i}] has no string `type`"));
+        }
+    }
+    if value.get("isError").is_some_and(|e| !e.is_boolean()) {
+        return Err("`isError` is not a boolean".to_owned());
+    }
+    Ok(value)
+}
+
+fn stderr_tail(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .nth(TOOL_RESULT_STDERR_TAIL - 1)
+        .map_or(0, |(i, _)| i);
+    trimmed[start..].to_owned()
+}
+
+fn tool_error_response(message: String) -> BackendResponse {
+    envelope_response(serde_json::json!({
+        VERBATIM_RESULT_KEY: {
+            "isError": true,
+            "content": [{ "type": "text", "text": message }],
+        }
+    }))
 }
 
 fn envelope_response(envelope: Value) -> BackendResponse {
@@ -729,6 +841,120 @@ mod tests {
         assert_eq!(env["response"]["success"], true);
         assert!(env["downstreamError"].is_null());
         assert_eq!(env["response"]["json"]["hello"], "world");
+    }
+
+    /// Run one `sh -c script` call in `result: tool_result` and return the
+    /// `CallToolResult` the gateway would project.
+    async fn tool_result_of(script: &str, extra: Value) -> Value {
+        let plugin = CommandBackendPlugin::new();
+        let mut spec = serde_json::json!({
+            "command": "sh",
+            "args": ["-c", script],
+            "result": "tool_result",
+        });
+        spec.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        plugin
+            .register_profile("c", &spec, mcpg_plugin_protocol::noop_backend_host())
+            .await
+            .expect("register");
+        let resp = plugin
+            .execute("c", req(serde_json::json!({"n": 7})))
+            .await
+            .expect("execute");
+        let mut payload: Value = serde_json::from_slice(&resp.payload).unwrap();
+        payload
+            .get_mut(VERBATIM_RESULT_KEY)
+            .map(Value::take)
+            .expect("a tool result")
+    }
+
+    fn error_text(result: &Value) -> &str {
+        assert_eq!(result["isError"], true, "{result}");
+        result["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn tool_result_stdout_is_the_call_result() {
+        let result = tool_result_of(
+            r#"printf '{"content":[{"type":"image","data":"AAAA","mimeType":"image/png"},{"type":"text","text":"ok"}],"structuredContent":{"w":2}}'"#,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(result["content"][0]["type"], "image");
+        assert_eq!(result["content"][0]["data"], "AAAA");
+        assert_eq!(result["content"][1]["text"], "ok");
+        assert_eq!(result["structuredContent"]["w"], 2);
+        assert!(result.get("isError").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_result_keeps_the_scripts_own_error_flag() {
+        let result = tool_result_of(
+            r#"printf '{"isError":true,"content":[{"type":"text","text":"no window 9"}]}'"#,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(error_text(&result), "no window 9");
+    }
+
+    #[tokio::test]
+    async fn tool_result_reports_a_failed_exit_with_the_stderr_tail() {
+        let result =
+            tool_result_of("echo 'boom: bad input' >&2; exit 4", serde_json::json!({})).await;
+        assert_eq!(
+            error_text(&result),
+            "command exited with status 4: boom: bad input"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_refuses_stdout_that_is_not_a_tool_result() {
+        for (script, reason) in [
+            ("echo plain text", "not JSON"),
+            (r#"printf '{"ok":true}'"#, "no `content` array"),
+            (
+                r#"printf '{"content":[{"text":"x"}]}'"#,
+                "content[0] has no string `type`",
+            ),
+            (
+                r#"printf '{"content":[],"isError":"yes"}'"#,
+                "`isError` is not a boolean",
+            ),
+        ] {
+            let result = tool_result_of(script, serde_json::json!({})).await;
+            let text = error_text(&result);
+            assert!(
+                text.starts_with("command stdout is not a tool result: "),
+                "{text}"
+            );
+            assert!(text.contains(reason), "{script}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_reports_a_timeout_and_an_oversized_stdout() {
+        let slow = tool_result_of("sleep 5", serde_json::json!({ "timeout_ms": 200 })).await;
+        assert_eq!(error_text(&slow), "command timed out after 200 ms");
+        let big = tool_result_of(
+            r#"printf '{"content":[{"type":"text","text":"0123456789"}]}'"#,
+            serde_json::json!({ "max_output_bytes": 16 }),
+        )
+        .await;
+        assert_eq!(
+            error_text(&big),
+            "command stdout is larger than max_output_bytes (16)"
+        );
+    }
+
+    #[test]
+    fn the_stderr_tail_keeps_the_last_characters() {
+        let long = format!("{}END", "é".repeat(TOOL_RESULT_STDERR_TAIL));
+        let tail = stderr_tail(&long);
+        assert_eq!(tail.chars().count(), TOOL_RESULT_STDERR_TAIL);
+        assert!(tail.ends_with("END"));
+        assert_eq!(stderr_tail("  short \n"), "short");
     }
 
     #[tokio::test]
